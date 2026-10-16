@@ -1,4 +1,4 @@
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import json
@@ -106,6 +106,8 @@ class ReaderTests(unittest.TestCase):
             first = reader.pull_once(self.client, self.root)
         self.assertEqual((first["cursor"]["after"], first["sourceHead"], first["hasMore"]),
                          (1, 3, True))
+        self.assertEqual(first["cursorBefore"], {"after": 0})
+        self.assertEqual(first["statusObservedSince"], "1970-01-01T00:00:00Z")
         self.assertEqual(first["httpStatus"], 200)
         self.assertEqual((first["headComparedToPrevious"], first["sameHeadSince"], first["observedAt"]),
                          ("first", "1970-01-01T00:00:00Z", "1970-01-01T00:00:00Z"))
@@ -141,6 +143,8 @@ class ReaderTests(unittest.TestCase):
             advanced = reader.pull_once(reader.AgentReader(self.origin, TOKEN, allow_localhost=True), self.root)
         self.assertEqual((advanced["sourceHead"], advanced["headComparedToPrevious"],
                           advanced["sameHeadSince"]), (4, "advanced", "1970-01-04T00:00:00Z"))
+        self.assertEqual(complete["cursorBefore"]["after"], 1)
+        self.assertEqual(advanced["statusObservedSince"], first["statusObservedSince"])
         self.assertEqual(advanced["httpStatus"], 200)
 
     def test_prior_head_observation_gains_http_status_without_losing_history(self):
@@ -150,6 +154,7 @@ class ReaderTests(unittest.TestCase):
         with self.db() as db:
             prior = json.loads(db.execute("SELECT value FROM meta WHERE key='source_head:discussions'").fetchone()[0])
             prior.pop("httpStatus")  # State written by an earlier reader version.
+            prior.pop("statusObservedSince")
             db.execute("UPDATE meta SET value=? WHERE key='source_head:discussions'", (json.dumps(prior),))
         with patch.object(reader.time, "time", return_value=86400):
             result = reader.pull_once(reader.AgentReader(self.origin, TOKEN, allow_localhost=True), self.root)
@@ -157,8 +162,29 @@ class ReaderTests(unittest.TestCase):
                          (200, "unchanged", "1970-01-01T00:00:00Z"))
         with self.db() as db:
             saved = json.loads(db.execute("SELECT value FROM meta WHERE key='source_head:discussions'").fetchone()[0])
+        self.assertEqual(result["statusObservedSince"], "1970-01-02T00:00:00Z")
+        self.assertEqual(saved["statusObservedSince"], result["statusObservedSince"])
         self.assertEqual((saved["httpStatus"], saved["sameHeadSince"]),
                          (200, "1970-01-01T00:00:00Z"))
+
+    def test_status_capture_start_is_not_backfilled_from_legacy_status(self):
+        self.response = page(1, events=[], head=1)
+        with patch.object(reader.time, "time", return_value=0):
+            reader.pull_once(self.client, self.root)
+        with self.db() as db:
+            prior = json.loads(db.execute("SELECT value FROM meta WHERE key='source_head:discussions'").fetchone()[0])
+            prior.pop("statusObservedSince")  # Older status-aware state has no coverage start.
+            db.execute("UPDATE meta SET value=? WHERE key='source_head:discussions'", (json.dumps(prior),))
+        with patch.object(reader.time, "time", return_value=86400):
+            migrated = reader.pull_once(self.client, self.root)
+        self.assertEqual(migrated["sameHeadSince"], "1970-01-01T00:00:00Z")
+        self.assertEqual(migrated["statusObservedSince"], "1970-01-02T00:00:00Z")
+        with patch.object(reader.time, "time", return_value=172800):
+            resumed = reader.pull_once(self.client, self.root)
+        self.assertEqual(resumed["statusObservedSince"], migrated["statusObservedSince"])
+        with self.db() as db:
+            saved = json.loads(db.execute("SELECT value FROM meta WHERE key='source_head:discussions'").fetchone()[0])
+        self.assertEqual(saved["statusObservedSince"], migrated["statusObservedSince"])
 
     def test_identical_empty_successes_cannot_identify_upstream_activity(self):
         self.response = page(1, events=[], head=1)
@@ -172,6 +198,43 @@ class ReaderTests(unittest.TestCase):
                          tuple(measured[1][field] for field in fields))
         self.assertNotEqual(measured[0]["observedAt"], measured[1]["observedAt"])
         self.assertEqual(measured[0]["httpStatus"], 200)
+
+    def test_admitted_probe_does_not_establish_other_item_completeness(self):
+        probe = {"seq": 2, "kind": "message", "payload": {"content": "synthetic ordinary probe"}}
+        measured = []
+        source_comparisons = []
+        source_scopes = (
+            ("no_other_eligible_work", "production-resource/account/principal"),
+            ("eligible_work_filtered", "production-resource/account/principal"),
+            ("cross_source_probe", "other-resource/account/principal"),
+            ("unknown_probe_source", None),
+        )
+        production_scope = "production-resource/account/principal"
+        for interpretation, probe_scope in source_scopes:
+            # Caller-owned source interpretations share one wire response.
+            # No filter, credential manager or source router is simulated.
+            inbox = self.root / interpretation
+            self.response = page(0, events=[], head=0)
+            reader.pull_once(self.client, inbox)
+            self.response = page(2, events=[probe], head=2)
+            receipt = reader.pull_once(self.client, inbox)
+            with closing(sqlite3.connect(inbox / "inbox.sqlite")) as db:
+                records = db.execute("SELECT record FROM events").fetchall()
+            self.assertEqual([{key: json.loads(row[0])[key] for key in probe}
+                              for row in records], [probe])
+            self.assertEqual((receipt["processed"], receipt["inserted"]), (1, 1))
+            self.assertEqual(receipt["headComparedToPrevious"], "advanced")
+            measured.append(tuple(receipt[field] for field in
+                                  ("httpStatus", "sourceHead", "processed", "hasMore",
+                                   "headComparedToPrevious")))
+            source_comparisons.append("unknown" if probe_scope is None else
+                                      "same-source" if probe_scope == production_scope else
+                                      "cross-source")
+        self.assertEqual(measured[0], measured[1])
+        self.assertEqual(measured[1], measured[2])
+        self.assertEqual(measured[2], measured[3])
+        self.assertEqual(source_comparisons,
+                         ["same-source", "same-source", "cross-source", "unknown"])
 
     def test_body_cannot_spoof_observed_transport_status(self):
         for claimed in (418, 401):
@@ -260,6 +323,26 @@ class ReaderTests(unittest.TestCase):
             reader.pull_once(self.client, linked_root)
         self.assertEqual(self.requests, [])
 
+    def test_symlinked_temp_alias_accepts_physical_path_only(self):
+        physical_parent = self.root / "physical-temp"
+        physical_parent.mkdir()
+        alias = self.root / "temp-alias"
+        try:
+            alias.symlink_to(physical_parent, target_is_directory=True)
+        except OSError as error:
+            if os.name == "nt" and getattr(error, "winerror", None) == 1314:
+                self.skipTest("Windows account cannot create symbolic links (WinError 1314)")
+            raise
+        with tempfile.TemporaryDirectory(dir=alias.resolve()) as fixture:
+            physical_inbox = Path(fixture)
+            accepted = reader.pull_once(self.client, physical_inbox)
+            self.assertEqual(accepted["processed"], 1)
+            self.assertEqual(len(self.requests), 1)
+            alias_inbox = alias / physical_inbox.name
+            with self.assertRaisesRegex(reader.ReaderError, "linked_inbox_path"):
+                reader.pull_once(self.client, alias_inbox)
+            self.assertEqual(len(self.requests), 1)
+
     def test_python311_junction_metadata_blocks_each_inbox_path_before_network(self):
         # Simulate Python 3.11's lstat fields without Path.is_junction.
         mount_tag, reparse_flag = 0xA0000003, 0x400
@@ -346,7 +429,7 @@ class ReaderTests(unittest.TestCase):
             reader.pull_once(self.client, self.root)
         self.assertEqual(error.exception.status, 302)
         self.assertFalse(any("token-sink" in route for route, _ in self.requests))
-        for code in [201, 401, 409, 429, 503]:
+        for code in [201, 401, 403, 409, 429, 503]:
             self.status, self.headers = code, {"Retry-After": "120"}
             with self.assertRaises(reader.ReaderError) as error:
                 reader.pull_once(self.client, self.root)
@@ -387,6 +470,326 @@ class ReaderTests(unittest.TestCase):
             with self.assertRaisesRegex(reader.ReaderError, "connection_failed") as error:
                 self.client.changes()
             self.assertNotIn(TOKEN, str(error.exception))
+
+
+class CallerCredentialExampleTests(unittest.TestCase):
+    def test_published_aggregation_refuses_unverified_or_mismatched_coverage(self):
+        guide = (Path(__file__).resolve().parents[1] / "docs" / "PYTHON-READER.md").read_text()
+        section = guide.split("## Caller policy: pin expectations before reading\n", 1)[1]
+        code = section.split("```python\n", 1)[1].split("\n```", 1)[0]
+        namespace = {}
+        exec(compile(code, "docs/PYTHON-READER.md", "exec"), namespace)
+        total = namespace["verified_total"]
+        a = ("origin-a", "discussions", "all", "window-1")
+        b = ("origin-a", "work", "all", "window-1")
+        verified = {"grade": "verified", "count": 2}
+        self.assertEqual(total((a, b), {a: verified, b: {"grade": "verified", "count": 0}}), 2)
+        for grade in ("observed_empty_unverified", "incomplete", "indeterminate"):
+            with self.subTest(grade=grade):
+                self.assertIsNone(total((a, b), {a: verified, b: {"grade": grade, "count": 0}}))
+        for other in (("origin-b", *b[1:]), (*b[:3], "window-2")):
+            self.assertIsNone(total((a, b), {a: verified, other: verified}))
+        self.assertIsNone(total((a, b), {a: verified}))
+        self.assertIsNone(total((), {}))
+        self.assertIsNone(total((a,), {a: None}))
+        self.assertEqual(total((a, a), {a: verified}), 2)
+        self.assertIsNone(total((a,), {a: {"grade": "verified", "count": True}}))
+
+    def test_published_gate_keeps_credential_failures_out_of_digests(self):
+        guide = (Path(__file__).resolve().parents[1] / "docs" / "PYTHON-READER.md").read_text()
+        section = guide.split("## Caller example: keep credential failure out of an empty digest\n", 1)[1]
+        code = section.split("```python\n", 1)[1].split("\n```", 1)[0]
+        namespace = {}
+        exec(compile(code, "docs/PYTHON-READER.md", "exec"), namespace)
+        guarded_pull = namespace["guarded_pull"]
+
+        empty = {"httpStatus": 200, "hasMore": False, "processed": 0}
+        nonempty = {"httpStatus": 200, "hasMore": False, "processed": 1}
+
+        def committed(*, token="synthetic-current-token", credential_id="credential-1",
+                      generation="g1", attempt_id="attempt-1", state="committed"):
+            return {"attemptId": attempt_id, "state": state, "credentialId": credential_id,
+                    "generation": generation, "token": token}
+
+        current = committed()
+        old_committed = committed(token="synthetic-old-token", credential_id="credential-old",
+                                  generation="g-old")
+        mutable_current = committed()
+        cases = (
+            # name, wrapper state, wrapper token, authority records, page, result, calls, selected token
+            ("refresh_exception", "raises", "synthetic-old-token", (), empty, "indeterminate",
+             ("attempt", "acquire"), None),
+            ("unavailable", "unavailable", "synthetic-old-token", (current,), empty, "indeterminate",
+             ("attempt", "acquire"), None),
+            ("stale_with_age", "stale-with-age", "synthetic-old-token", (current,), empty, "indeterminate",
+             ("attempt", "acquire"), None),
+            ("caught_failure_claims_fresh", "fresh", "synthetic-old-token", (None,), empty, "indeterminate",
+             ("attempt", "acquire", "authority"), None),
+            ("half_committed_refresh", "fresh", "synthetic-old-token",
+             (committed(generation="g2", token="synthetic-new-token", state="pending"),),
+             empty, "indeterminate", ("attempt", "acquire", "authority"), None),
+            ("wrong_attempt", "fresh", "synthetic-old-token",
+             (committed(attempt_id="another-attempt"),), empty, "indeterminate",
+             ("attempt", "acquire", "authority"), None),
+            # A swallowed refresh can propose an old token as fresh. Its committed
+            # attempt selection is evaluated by independent manager eligibility.
+            ("swallowed_refresh_fallback_revoked", "fresh", "synthetic-old-token",
+             (old_committed,), empty, "indeterminate",
+             ("attempt", "acquire", "authority"), None),
+            ("swallowed_refresh_fallback_valid_reuse", "fresh", "synthetic-old-token",
+             (old_committed, old_committed), empty, "observed_empty_unverified",
+             ("attempt", "acquire", "authority", "read", "authority"),
+             "synthetic-old-token"),
+            ("revoked_before_read", "reused", "synthetic-current-token",
+             (current,), empty, "indeterminate", ("attempt", "acquire", "authority"), None),
+            ("revoked_after_read", "reused", "synthetic-current-token",
+             (current, current), nonempty, "indeterminate",
+             ("attempt", "acquire", "authority", "read", "authority"),
+             "synthetic-current-token"),
+            ("eligibility_wrong_identity", "reused", "synthetic-current-token",
+             (current,), empty, "indeterminate", ("attempt", "acquire", "authority"), None),
+            ("eligibility_missing_time", "reused", "synthetic-current-token",
+             (current,), empty, "indeterminate", ("attempt", "acquire", "authority"), None),
+            ("eligibility_noncanonical_time", "reused", "synthetic-current-token",
+             (current,), empty, "indeterminate", ("attempt", "acquire", "authority"), None),
+            ("bare_string_eligibility", "reused", "synthetic-current-token",
+             (current,), empty, "indeterminate", ("attempt", "acquire", "authority"), None),
+            ("selection_changed_after_read", "fresh", "synthetic-old-token",
+             (current, committed(credential_id="credential-2", generation="g2")),
+             empty, "indeterminate", ("attempt", "acquire", "authority", "read", "authority"),
+             "synthetic-current-token"),
+            ("same_ids_token_changed_after_read", "fresh", "synthetic-current-token",
+             (current, committed(token="synthetic-replaced-token")),
+             nonempty, "indeterminate", ("attempt", "acquire", "authority", "read", "authority"),
+             "synthetic-current-token"),
+            ("mutable_selected_record", "fresh", "synthetic-current-token",
+             (mutable_current, mutable_current), nonempty, "indeterminate",
+             ("attempt", "acquire", "authority", "read", "authority"),
+             "synthetic-current-token"),
+            ("missing_receipt", "fresh", "synthetic-current-token", (current, current),
+             None, "indeterminate", ("attempt", "acquire", "authority", "read", "authority"),
+             "synthetic-current-token"),
+            ("raw_http_401", "fresh", "synthetic-current-token", (current, current),
+             {**empty, "httpStatus": 401}, "indeterminate",
+             ("attempt", "acquire", "authority", "read", "authority"),
+             "synthetic-current-token"),
+            ("raw_http_403", "fresh", "synthetic-current-token", (current, current),
+             {**empty, "httpStatus": 403}, "indeterminate",
+             ("attempt", "acquire", "authority", "read", "authority"),
+             "synthetic-current-token"),
+            ("reader_rejects_401", "fresh", "synthetic-current-token", (current,),
+             None, "indeterminate", ("attempt", "acquire", "authority", "read"),
+             "synthetic-current-token"),
+            ("reader_rejects_403", "fresh", "synthetic-current-token", (current,),
+             None, "indeterminate", ("attempt", "acquire", "authority", "read"),
+             "synthetic-current-token"),
+            ("fresh_empty", "fresh", "synthetic-current-token", (current, current),
+             empty, "observed_empty_unverified",
+             ("attempt", "acquire", "authority", "read", "authority"), "synthetic-current-token"),
+            ("old_last_known_empty", "reused", "synthetic-current-token", (current, current),
+             empty, "observed_empty_unverified",
+             ("attempt", "acquire", "authority", "read", "authority"),
+             "synthetic-current-token"),
+            ("sink_mutates_copy", "fresh", "synthetic-current-token", (current, current),
+             nonempty, "nonempty_written",
+             ("attempt", "acquire", "authority", "read", "authority", "digest"),
+             "synthetic-current-token"),
+            ("sink_failure_after_read", "fresh", "synthetic-current-token", (current, current),
+             nonempty, "indeterminate",
+             ("attempt", "acquire", "authority", "read", "authority"),
+             "synthetic-current-token"),
+            ("misleading_old_token", "fresh", "synthetic-old-token",
+             (committed(token="synthetic-new-token", generation="g2"),
+              committed(token="synthetic-new-token", generation="g2")),
+             empty, "observed_empty_unverified",
+             ("attempt", "acquire", "authority", "read", "authority"), "synthetic-new-token"),
+            ("fresh_incomplete", "fresh", "synthetic-current-token", (current, current),
+             {**empty, "hasMore": True}, "incomplete",
+             ("attempt", "acquire", "authority", "read", "authority"), "synthetic-current-token"),
+            ("reused_credential_nonempty", "reused", "synthetic-current-token", (current, current),
+             nonempty, "nonempty_written",
+             ("attempt", "acquire", "authority", "read", "authority", "digest"),
+             "synthetic-current-token"),
+            ("fresh_nonempty", "fresh", "synthetic-current-token", (current, current),
+             nonempty, "nonempty_written",
+             ("attempt", "acquire", "authority", "read", "authority", "digest"),
+             "synthetic-current-token"),
+        )
+        for name, state, claimed_token, authority_records, receipt, expected, expected_calls, selected_token in cases:
+            with self.subTest(name=name):
+                calls = []
+                remaining = list(authority_records)
+                eligibility_returns = list({
+                    "swallowed_refresh_fallback_revoked": ("revoked",),
+                    "revoked_before_read": ("revoked",),
+                    "revoked_after_read": ("eligible", "revoked"),
+                }.get(name, ("eligible", "eligible")))
+                eligibility_calls = []
+                recorded_observations = []
+                caught_refresh_failures = []
+
+                def new_attempt_id():
+                    calls.append("attempt")
+                    return "attempt-1"
+
+                def acquire(attempt_id):
+                    calls.append("acquire")
+                    self.assertEqual(attempt_id, "attempt-1")
+                    if state == "raises":
+                        raise RuntimeError("synthetic late refresh failure")
+                    if name.startswith("swallowed_refresh_fallback_"):
+                        try:
+                            raise RuntimeError("synthetic refresh failed before fallback")
+                        except RuntimeError as error:
+                            caught_refresh_failures.append(str(error))
+                        # Deliberately misleading wrapper proposal; the independent
+                        # committed attempt and eligibility decide whether to read.
+                    return {"state": state, "generation": "g2", "token": claimed_token}
+
+                def load_committed_attempt(attempt_id):
+                    calls.append("authority")
+                    self.assertEqual(attempt_id, "attempt-1")
+                    return remaining.pop(0)
+
+                def load_credential_eligibility(credential_id, generation):
+                    eligibility_calls.append((credential_id, generation))
+                    self.assertEqual((credential_id, generation),
+                                     (authority_records[0]["credentialId"],
+                                      authority_records[0]["generation"]))
+                    state = eligibility_returns.pop(0)
+                    if name == "bare_string_eligibility":
+                        return state
+                    observation = {"credentialId": credential_id, "generation": generation,
+                                   "state": state,
+                                   "checkedAtUtc": ("2024-01-01T00:00:00Z" if name == "old_last_known_empty"
+                                                    else "2026-10-15T22:00:00Z")}
+                    if name == "eligibility_wrong_identity":
+                        observation["credentialId"] = "credential-2"
+                    if name == "eligibility_missing_time":
+                        observation.pop("checkedAtUtc")
+                    if name == "eligibility_noncanonical_time":
+                        observation["checkedAtUtc"] = "2026-1-5T22:00:00Z"
+                    if name == "old_last_known_empty":
+                        observation["token"] = "synthetic-private-token"
+                        observation["private"] = {"secret": "synthetic-private-metadata"}
+                    return observation
+
+                def record_eligibility_observation(attempt_id, phase, observation):
+                    self.assertEqual(attempt_id, "attempt-1")
+                    self.assertEqual(phase, "before" if not recorded_observations else "after")
+                    self.assertEqual(set(observation),
+                                     {"credentialId", "generation", "state", "checkedAtUtc"})
+                    self.assertNotIn("token", observation)
+                    if name == "sink_failure_after_read" and phase == "after":
+                        raise OSError("synthetic private record write failed")
+                    recorded_observations.append((phase, dict(observation)))
+                    if name == "sink_mutates_copy":
+                        observation["state"] = "revoked"
+
+                def read_once(token):
+                    calls.append("read")
+                    self.assertEqual(token, selected_token)
+                    if name in {"reader_rejects_401", "reader_rejects_403"}:
+                        raise reader.ReaderError("http_error", status=int(name[-3:]))
+                    if name == "mutable_selected_record":
+                        mutable_current["token"] = "synthetic-replaced-token"
+                    return receipt
+
+                def write_digest(value):
+                    calls.append("digest")
+                    self.assertIs(value, receipt)
+                    self.assertGreater(value["processed"], 0)
+
+                self.assertEqual(guarded_pull(new_attempt_id, acquire, load_committed_attempt,
+                                              load_credential_eligibility,
+                                              record_eligibility_observation, read_once,
+                                              write_digest), expected)
+                self.assertEqual(tuple(calls), expected_calls)
+                self.assertEqual(len(caught_refresh_failures),
+                                 1 if name.startswith("swallowed_refresh_fallback_") else 0)
+                self.assertEqual(len(remaining), len(authority_records) - expected_calls.count("authority"))
+                one_check = {"swallowed_refresh_fallback_revoked", "revoked_before_read",
+                             "eligibility_wrong_identity",
+                             "eligibility_missing_time", "eligibility_noncanonical_time",
+                             "bare_string_eligibility",
+                             "selection_changed_after_read",
+                             "same_ids_token_changed_after_read", "mutable_selected_record",
+                             "reader_rejects_401", "reader_rejects_403"}
+                expected_eligibility_checks = (1 if name in one_check else
+                                               2 if "read" in expected_calls else 0)
+                self.assertEqual(len(eligibility_calls), expected_eligibility_checks)
+                invalid_observation = {"eligibility_wrong_identity", "eligibility_missing_time",
+                                       "eligibility_noncanonical_time", "bare_string_eligibility"}
+                self.assertEqual(len(recorded_observations),
+                                 0 if name in invalid_observation else
+                                 expected_eligibility_checks - (name == "sink_failure_after_read"))
+                if name == "revoked_after_read":
+                    self.assertEqual([record["state"] for _, record in recorded_observations],
+                                     ["eligible", "revoked"])
+                if name == "swallowed_refresh_fallback_revoked":
+                    self.assertEqual([record["state"] for _, record in recorded_observations],
+                                     ["revoked"])
+                if name == "swallowed_refresh_fallback_valid_reuse":
+                    self.assertEqual([record["state"] for _, record in recorded_observations],
+                                     ["eligible", "eligible"])
+                if name == "old_last_known_empty":
+                    self.assertEqual([record["checkedAtUtc"] for _, record in recorded_observations],
+                                     ["2024-01-01T00:00:00Z"] * 2)
+
+        # The current credential row can rotate while this attempt's committed
+        # selection remains stable. Both observations still use the old token.
+        for receipt, expected, digest_count in ((nonempty, "nonempty_written", 1),
+                                                (empty, "observed_empty_unverified", 0)):
+            with self.subTest(rotation_result=expected):
+                calls = []
+                by_attempt = {"attempt-1": committed()}
+                current_row = committed(token="synthetic-new-token",
+                                        credential_id="credential-2", generation="g2")
+
+                def acquire(attempt_id):
+                    calls.append("acquire")
+                    self.assertEqual(attempt_id, "attempt-1")
+                    return {"state": "reused"}
+
+                def load_committed_attempt(attempt_id):
+                    calls.append("authority")
+                    return dict(by_attempt[attempt_id])
+
+                def load_credential_eligibility(credential_id, generation):
+                    calls.append("eligibility")
+                    self.assertEqual((credential_id, generation), ("credential-1", "g1"))
+                    # The old selection remains locally eligible despite pointer rotation.
+                    return {"credentialId": credential_id, "generation": generation,
+                            "state": "eligible", "checkedAtUtc": "2026-10-15T22:00:00Z"}
+
+                def record_eligibility_observation(attempt_id, phase, observation):
+                    calls.append("record_" + phase)
+                    self.assertEqual(attempt_id, "attempt-1")
+                    self.assertEqual((observation["credentialId"], observation["generation"]),
+                                     ("credential-1", "g1"))
+                    self.assertNotIn("token", observation)
+
+                def read_once(token):
+                    calls.append("read")
+                    self.assertEqual(token, "synthetic-current-token")
+                    current_row.update(generation="g3", token="synthetic-rotated-token")
+                    return receipt
+
+                def write_digest(value):
+                    calls.append("digest")
+                    self.assertIs(value, receipt)
+
+                result = guarded_pull(lambda: "attempt-1", acquire,
+                                      load_committed_attempt, load_credential_eligibility,
+                                      record_eligibility_observation, read_once,
+                                      write_digest)
+                self.assertEqual(result, expected)
+                self.assertEqual(current_row["generation"], "g3")
+                self.assertEqual(current_row["token"], "synthetic-rotated-token")
+                self.assertEqual(calls, ["acquire", "authority", "eligibility",
+                                         "record_before", "read", "authority", "eligibility",
+                                         "record_after"]
+                                 + ["digest"] * digest_count)
 
 
 if __name__ == "__main__":
